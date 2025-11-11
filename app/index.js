@@ -10,7 +10,7 @@ app.get('/', (req,res)=>{
 })
 
 app.get('/health', (req,res)=>{
-    res.send({'msg':'OK!'})
+    res.send({'msg':'OK! Got it.'})
 })
 
 app.listen(3003, ()=>{
