@@ -97,35 +97,68 @@ jobs:
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           ref: ${{ env.DEPLOY_BRANCH }}
           path: deploy-repo
+          fetch-depth: 0
+      
+      - name: Install yq (v4)
+        run: |
+          YQ_VER=v4.44.3
+          curl -L "https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64" -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+          yq --version
 
-      - name: Update image digest in deploy manifests
+      - name: Update image digest in deploy manifests (idempotent)
+        working-directory: deploy-repo
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          echo "Setting IMAGE_REF=${IMAGE_REF}"
+
+          # 1) Deployment: set containers[name==web].image = IMAGE_REF
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="web")).image = env(IMAGE_REF)
+          ' k8s/deployment.yaml
+
+          # 2) PreSync Job: set the LAST arg of containers[name==cosign-verify] to IMAGE_REF
+          # (args: [..., "__IMAGE_REF__" or previous digest]) -> replace terminal element
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="cosign-verify")).args |=
+            ( .[:-1] + [ env(IMAGE_REF) ] )
+          ' k8s/presync-verify.yaml
+
+          echo "Diff after yq updates (if any):"
+          git status --porcelain
+          git --no-pager diff
+      
+      - name: Commit changes (only if any)
         working-directory: deploy-repo
         run: |
-          IMAGE_REF="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
-          echo "Using IMAGE_REF=$IMAGE_REF"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Update Deployment image line (digest-based)
-          sed -i "s|image: .*__IMAGE_REF__|image: ${IMAGE_REF}|g" k8s/deployment.yaml
+          # Stage only if there are actual changes
+          if ! git diff --quiet; then
+            git add k8s/deployment.yaml k8s/presync-verify.yaml
+            git commit -m "chore: set image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          else
+            echo "No manifest changes detected (same digest). Skipping PR creation."
+            echo "skip_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+        id: commitcheck
 
-          # Update PreSync verify hook placeholder with exact reference
-          sed -i "s|__IMAGE_REF__|${IMAGE_REF}|g" k8s/presync-verify.yaml
-
-          git checkout -b update-image-${{ steps.meta.outputs.short_sha }}
-          git add k8s/deployment.yaml k8s/presync-verify.yaml
-          git commit -m "chore: update image to ${IMAGE_REF}"
-          git push -u origin HEAD
 
       - name: Open PR to deploy repo
+        if: steps.commitcheck.outputs.skip_pr != 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.DEPLOY_REPO_TOKEN }}
           path: deploy-repo
-          branch: update-image-${{ steps.meta.outputs.short_sha }}
+          # Unique branch every run to avoid reusing an old one
+          branch: update-image-${{ steps.meta.outputs.short_sha }}-${{ github.run_number }}
+          base: ${{ env.DEPLOY_BRANCH }}
           title: "Update image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
-          commit-message: "chore: update image digest and presync verify ref"
+          commit-message: "chore: set image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
           body: |
             - Image: `${{ env.IMAGE }}@${{ steps.build.outputs.digest }}`
-            - Signed with Cosign (keyless).
+            - Signed with Cosign (keyless via OIDC).
             - SBOM generated for commit `${{ steps.meta.outputs.short_sha }}`.
           labels: ci
-          base: ${{ env.DEPLOY_BRANCH }}
