@@ -6,7 +6,7 @@ app.get('/user', (req,res)=>{
 })
 
 app.get('/', (req,res)=>{
-    res.send({'msg':'Hello'})
+    res.send({'msg':'Hello from India'})
 })
 
 app.get('/health', (req,res)=>{
