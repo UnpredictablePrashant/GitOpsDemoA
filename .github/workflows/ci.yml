@@ -22,6 +22,7 @@ jobs:
       id-token: write   # for keyless signing (cosign OIDC)
       packages: write
       pull-requests: write
+      security-events: write 
     steps:
       - name: Checkout app repo
         uses: actions/checkout@v4
