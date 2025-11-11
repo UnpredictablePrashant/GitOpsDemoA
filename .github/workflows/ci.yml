@@ -157,12 +157,16 @@ jobs:
             (.spec.template.spec.containers[] | select(.name=="web")).image = env(IMAGE_REF)
           ' k8s/deployment.yaml
 
-          # 2) PreSync Job: set the LAST arg of containers[name==cosign-verify] to IMAGE_REF
+          # 2) PreSync Job for cosign and sbom: set the LAST arg of containers[name==cosign-verify] to IMAGE_REF
           # (args: [..., "__IMAGE_REF__" or previous digest]) -> replace terminal element
           yq -i '
             (.spec.template.spec.containers[] | select(.name=="cosign-verify")).args |=
             ( .[:-1] + [ env(IMAGE_REF) ] )
           ' k8s/presync-verify.yaml
+          yq -i '
+            (.spec.template.spec.containers[] | select(.name=="verify-sbom")).args |=
+            ( .[:-1] + [ env(IMAGE_REF) ] )
+          ' k8s/presync-verify-sbom.yaml
 
           echo "Diff after yq updates (if any):"
           git status --porcelain
