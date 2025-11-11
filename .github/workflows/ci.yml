@@ -1,0 +1,131 @@
+name: build-sign-and-update-deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: gitops-demo-app
+  REGISTRY: docker.io
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/gitops-demo-app
+  DEPLOY_REPO: UnpredictablePrashant/GitOpsDemoB
+  DEPLOY_BRANCH: main
+  APP_PATH: app
+
+jobs:
+  build_sign_update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # for keyless signing (cosign OIDC)
+      packages: write
+      pull-requests: write
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: meta
+        run: echo "short_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push (tags: sha & latest)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.short_sha }}
+            ${{ env.IMAGE }}:latest
+          provenance: false
+          sbom: false
+
+      - name: Show built digest
+        run: echo "Digest is = ${{ steps.build.outputs.digest }}"
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.17.9
+
+      - name: Generate SBOM (SPDX JSON)
+        run: |
+          syft packages . -o spdx-json=sbom.spdx.json
+        working-directory: ${{ env.APP_PATH }}
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.short_sha }}
+          path: ${{ env.APP_PATH }}/sbom.spdx.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.6.0
+
+      - name: Cosign sign (keyless via OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes \
+            ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+
+      - name: Prepare deploy repo update
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          ref: ${{ env.DEPLOY_BRANCH }}
+          path: deploy-repo
+
+      - name: Update image digest in deploy manifests
+        working-directory: deploy-repo
+        run: |
+          IMAGE_REF="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          echo "Using IMAGE_REF=$IMAGE_REF"
+
+          # Update Deployment image line (digest-based)
+          sed -i "s|image: .*__IMAGE_REF__|image: ${IMAGE_REF}|g" k8s/deployment.yaml
+
+          # Update PreSync verify hook placeholder with exact reference
+          sed -i "s|__IMAGE_REF__|${IMAGE_REF}|g" k8s/presync-verify.yaml
+
+          git checkout -b update-image-${{ steps.meta.outputs.short_sha }}
+          git add k8s/deployment.yaml k8s/presync-verify.yaml
+          git commit -m "chore: update image to ${IMAGE_REF}"
+          git push -u origin HEAD
+
+      - name: Open PR to deploy repo
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
+          path: deploy-repo
+          branch: update-image-${{ steps.meta.outputs.short_sha }}
+          title: "Update image to ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          commit-message: "chore: update image digest and presync verify ref"
+          body: |
+            - Image: `${{ env.IMAGE }}@${{ steps.build.outputs.digest }}`
+            - Signed with Cosign (keyless).
+            - SBOM generated for commit `${{ steps.meta.outputs.short_sha }}`.
+          labels: ci
+          base: ${{ env.DEPLOY_BRANCH }}
